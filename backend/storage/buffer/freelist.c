@@ -111,8 +111,18 @@ FifoSweep(void)
 	 * Atomically move hand ahead one buffer - if there's several processes
 	 * doing this, this can lead to buffers being returned slightly out of
 	 * apparent order.
-	 */
-	victim = pg_atomic_fetch_add_u32(&StrategyControl->nextVictimBuffer, 1);
+     * The 'victim' represents the index of the buffer that will be considered
+     * for replacement in this FIFO sweep.
+    */
+    victim = pg_atomic_fetch_add_u32(&StrategyControl->nextVictimBuffer, 1);
+
+    /*
+     * Check if the victim index has exceeded the total number of buffers.
+     * If so, wrap it around to ensure we stay within the valid buffer range.
+     * 
+     * This modulo operation implements the 'circular' nature of our FIFO,
+     * allowing us to continuously cycle through all buffers.
+     */
 
 	if (victim >= NBuffers)
 	{
