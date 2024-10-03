@@ -35,6 +35,10 @@ ifeq ($(with_llvm), yes)
 SUBDIRS += backend/jit/llvm
 endif
 
+ifeq ($(clock), 1)
+    CFLAGS += -DDEBUG
+endif
+
 # There are too many interdependencies between the subdirectories, so
 # don't attempt parallel make here.
 .NOTPARALLEL:
