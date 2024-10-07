@@ -102,37 +102,47 @@ static void AddBufferToRing(BufferAccessStrategy strategy,
 /*
 	* FIFO replacement strategy
 */
-static inline uint32
-FifoSweep(void)
+static uint32
+FifoBufferSelection(void)
 {
-	uint32		victim;
+    uint32 victim;
 
-	/*
-	 * Atomically move hand ahead one buffer - if there's several processes
-	 * doing this, this can lead to buffers being returned slightly out of
-	 * apparent order.
-     * The 'victim' represents the index of the buffer that will be considered
-     * for replacement in this FIFO sweep.
-    */
+    /*
+     * Atomically move to the next buffer. This ensures thread-safety
+     * in multi-process environments.
+     */
     victim = pg_atomic_fetch_add_u32(&StrategyControl->nextVictimBuffer, 1);
 
     /*
-     * Check if the victim index has exceeded the total number of buffers.
-     * If so, wrap it around to ensure we stay within the valid buffer range.
-     * 
-     * This modulo operation implements the 'circular' nature of our FIFO,
-     * allowing us to continuously cycle through all buffers.
+     * If we've reached or exceeded the total number of buffers,
+     * wrap around to the beginning. This maintains the FIFO order.
      */
+    if (victim >= NBuffers)
+    {
+        victim = victim % NBuffers;
 
-	if (victim >= NBuffers)
-	{
-		/* always wrap what we look up in BufferDescriptors */
-		victim = victim % NBuffers;
-	}
+        /*
+         * If we've just completed a full cycle (wrapped back to 0),
+         * increment the completePasses counter. This can be useful
+         * for tracking how many times we've cycled through all buffers.
+         */
+        if (victim == 0)
+        {
+            SpinLockAcquire(&StrategyControl->buffer_strategy_lock);
+            StrategyControl->completePasses++;
+            SpinLockRelease(&StrategyControl->buffer_strategy_lock);
+        }
 
-	return victim;
+        /*
+         * Update nextVictimBuffer to reflect the wrap-around.
+         * This is done outside the above if-statement to handle cases
+         * where victim > NBuffers.
+         */
+        pg_atomic_write_u32(&StrategyControl->nextVictimBuffer, victim);
+    }
+
+    return victim;
 }
-
 /*
  * ClockSweepTick - Helper routine for StrategyGetBuffer()
  *
@@ -345,70 +355,80 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state, bool *from_r
 			UnlockBufHdr(buf, local_buf_state);
 		}
 	}
-
+	bool useFifo = true;
 	/* Nothing on the freelist, so run the "clock sweep" algorithm */
+	/* Clock sweep is called only in debug mode, we implemented FIFO for this*/
 	trycounter = NBuffers;
 	for (;;)
 	{
-		buf = GetBufferDescriptor(FifoSweep());
-		if (BUF_STATE_GET_REFCOUNT(local_buf_state) == 0)
-		{
-			return buf;
-		}
-		else if (--trycounter == 0)
-		{
+		if (useFifo){
+			buf = GetBufferDescriptor(FifoBufferSelection());
+			
 			/*
-			 * We've scanned all the buffers without making any state changes,
-			 * so all the buffers are pinned (or were when we looked at them).
-			 * We could hope that someone will free one eventually, but it's
-			 * probably better to fail than to risk getting stuck in an
-			 * infinite loop.
-			 */
-			UnlockBufHdr(buf, local_buf_state);
-			elog(ERROR, "no unpinned buffers available");
-		}
-		UnlockBufHdr(buf, local_buf_state);
+			* If the buffer is pinned or has a nonzero usage_count, we cannot use
+			* it; decrement the usage_count (unless pinned) and keep scanning.
+			*/
+			local_buf_state = LockBufHdr(buf);
 
-		#ifdef DEBUG
-		buf = GetBufferDescriptor(ClockSweepTick());
-		
-		/*
-		 * If the buffer is pinned or has a nonzero usage_count, we cannot use
-		 * it; decrement the usage_count (unless pinned) and keep scanning.
-		 */
-		local_buf_state = LockBufHdr(buf);
-
-		if (BUF_STATE_GET_REFCOUNT(local_buf_state) == 0)
-		{
-			if (BUF_STATE_GET_USAGECOUNT(local_buf_state) != 0)
+			if (BUF_STATE_GET_REFCOUNT(local_buf_state) == 0)
 			{
-				local_buf_state -= BUF_USAGECOUNT_ONE;
-
-				trycounter = NBuffers;
-			}
-			else
-			{
-				/* Found a usable buffer */
-				if (strategy != NULL)
-					AddBufferToRing(strategy, buf);
 				*buf_state = local_buf_state;
 				return buf;
 			}
-		}
-		else if (--trycounter == 0)
-		{
-			/*
-			 * We've scanned all the buffers without making any state changes,
-			 * so all the buffers are pinned (or were when we looked at them).
-			 * We could hope that someone will free one eventually, but it's
-			 * probably better to fail than to risk getting stuck in an
-			 * infinite loop.
-			 */
+			else if (--trycounter == 0)
+			{
+				/*
+				* We've scanned all the buffers without making any state changes,
+				* so all the buffers are pinned (or were when we looked at them).
+				* We could hope that someone will free one eventually, but it's
+				* probably better to fail than to risk getting stuck in an
+				* infinite loop.
+				*/
+				UnlockBufHdr(buf, local_buf_state);
+				elog(ERROR, "no unpinned buffers available");
+			}
 			UnlockBufHdr(buf, local_buf_state);
-			elog(ERROR, "no unpinned buffers available");
 		}
-		UnlockBufHdr(buf, local_buf_state);
-		#endif
+		else {
+			buf = GetBufferDescriptor(ClockSweepTick());
+			
+			/*
+			* If the buffer is pinned or has a nonzero usage_count, we cannot use
+			* it; decrement the usage_count (unless pinned) and keep scanning.
+			*/
+			local_buf_state = LockBufHdr(buf);
+
+			if (BUF_STATE_GET_REFCOUNT(local_buf_state) == 0)
+			{
+				if (BUF_STATE_GET_USAGECOUNT(local_buf_state) != 0)
+				{
+					local_buf_state -= BUF_USAGECOUNT_ONE;
+
+					trycounter = NBuffers;
+				}
+				else
+				{
+					/* Found a usable buffer */
+					if (strategy != NULL)
+						AddBufferToRing(strategy, buf);
+					*buf_state = local_buf_state;
+					return buf;
+				}
+			}
+			else if (--trycounter == 0)
+			{
+				/*
+				* We've scanned all the buffers without making any state changes,
+				* so all the buffers are pinned (or were when we looked at them).
+				* We could hope that someone will free one eventually, but it's
+				* probably better to fail than to risk getting stuck in an
+				* infinite loop.
+				*/
+				UnlockBufHdr(buf, local_buf_state);
+				elog(ERROR, "no unpinned buffers available");
+			}
+			UnlockBufHdr(buf, local_buf_state);
+		}
 
 	}
 }
